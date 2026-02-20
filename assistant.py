@@ -1199,7 +1199,8 @@ def process_email(email):
         travel_line = f"\n🚆 *Travel:* {travel_info['duration_text']} from Amsterdam Zuid"
 
     reply_preview = _tg_escape(reply_text[:1500] + ("..." if len(reply_text) > 1500 else ""))
-    email_preview = _tg_escape(email["body"][:2000].strip() + ("..." if len(email["body"]) > 2000 else ""))
+    _email_body = _strip_quoted_reply(email["body"]).strip()
+    email_preview = _tg_escape(_email_body[:2000] + ("..." if len(_email_body) > 2000 else ""))
 
     updated_note = "↻ *Draft updated — new message in thread*\n\n" if (existing_item and existing_item.get("status") == "pending") else ""
 
@@ -1223,6 +1224,7 @@ def process_email(email):
         [
             {"text": "✅ Send", "callback_data": f"send:{approval_id}"},
             {"text": "✏️ Edit & Send", "callback_data": f"edit:{approval_id}"},
+            {"text": "🗑️ Discard", "callback_data": f"discard:{approval_id}"},
         ],
     ]
 
@@ -1401,7 +1403,8 @@ def process_general_email(email):
     sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
     tg_subject = _tg_escape(email["subject"])
     reply_preview = _tg_escape(reply_text[:1500] + ("..." if len(reply_text) > 1500 else ""))
-    email_preview = _tg_escape(email["body"][:2000].strip() + ("..." if len(email["body"]) > 2000 else ""))
+    _email_body_gen = _strip_quoted_reply(email["body"]).strip()
+    email_preview = _tg_escape(_email_body_gen[:2000] + ("..." if len(_email_body_gen) > 2000 else ""))
     updated_note = "↻ *Draft updated — new message in thread*\n\n" if (existing_item and existing_item.get("status") == "pending") else ""
 
     to_header = email.get("to", "")
@@ -1420,6 +1423,7 @@ def process_general_email(email):
         [
             {"text": "✅ Send", "callback_data": f"gen_send:{approval_id}"},
             {"text": "✏️ Edit & Send", "callback_data": f"gen_edit:{approval_id}"},
+            {"text": "🗑️ Discard", "callback_data": f"gen_discard:{approval_id}"},
         ],
     ]
 

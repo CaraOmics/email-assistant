@@ -400,6 +400,19 @@ def _handle_telegram_update(update, token):
             else:
                 send_telegram("⚠️ Already sent or discarded.")
 
+        elif callback_data.startswith("discard:"):
+            approval_id = callback_data.split(":", 1)[1]
+            item = pending_approvals.get(approval_id)
+            if item and item["status"] == "pending":
+                pending_approvals[approval_id]["status"] = "discarded"
+                save_pending_approvals()
+                sender = item["email"]["sender"].split("<")[0].strip()
+                orig_msg_id = item.get("telegram_message_id")
+                if orig_msg_id:
+                    edit_telegram_message(orig_msg_id, f"🗑️ Discarded ({sender})", keyboard=[])
+            else:
+                send_telegram("⚠️ Already sent or discarded.")
+
         elif callback_data.startswith("cal:"):
             approval_id = callback_data.split(":", 1)[1]
             item = pending_approvals.get(approval_id)
@@ -557,6 +570,19 @@ def _handle_general_telegram_update(update, token):
                 if sent_id:
                     pending_approvals[f"gentg:{sent_id}"] = approval_id
                     save_pending_approvals()
+            else:
+                send_general_telegram("⚠️ Already sent or discarded.")
+
+        elif callback_data.startswith("gen_discard:"):
+            approval_id = callback_data.split(":", 1)[1]
+            item = pending_approvals.get(approval_id)
+            if item and item["status"] == "pending":
+                pending_approvals[approval_id]["status"] = "discarded"
+                save_pending_approvals()
+                sender = item["email"]["sender"].split("<")[0].strip()
+                orig_msg_id = item.get("telegram_message_id")
+                if orig_msg_id:
+                    edit_general_telegram_message(orig_msg_id, f"🗑️ Discarded ({sender})", keyboard=[])
             else:
                 send_general_telegram("⚠️ Already sent or discarded.")
 
