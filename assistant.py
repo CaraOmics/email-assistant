@@ -1116,6 +1116,86 @@ def send_telegram(message, keyboard=None):
         return None
 
 
+def build_meeting_tg_message(approval_id):
+    """Build the Telegram message text and keyboard for a meeting approval item."""
+    item = pending_approvals.get(approval_id)
+    if not item:
+        return None, None
+    email = item["email"]
+    reply_text = item["reply_text"]
+    meeting_details = item.get("meeting_details") or {}
+    travel_info = item.get("travel_info")
+
+    sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
+    tg_location = _tg_escape(meeting_details.get("location") or "Not specified")
+    proposed_date = _tg_escape(meeting_details.get("proposed_date") or "Not specified")
+    proposed_time = _tg_escape(meeting_details.get("proposed_time") or "")
+    tg_subject = _tg_escape(email["subject"])
+    travel_line = f"\n🚆 *Travel:* {travel_info['duration_text']} from Amsterdam Zuid" if travel_info else ""
+
+    reply_preview = _tg_escape(reply_text[:1500] + ("..." if len(reply_text) > 1500 else ""))
+    _email_body = _strip_quoted_reply(email["body"]).strip()
+    email_preview = _tg_escape(_email_body[:2000] + ("..." if len(_email_body) > 2000 else ""))
+
+    to_header = email.get("to", "")
+    group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
+
+    header = (
+        f"✏️ *Re-drafted*\n\n"
+        f"{group_note}"
+        f"📬 *New meeting request*\n"
+        f"*From:* {sender_name}\n"
+        f"*Subject:* {tg_subject}\n"
+        f"*Date:* {proposed_date} {proposed_time}\n"
+        f"*Location:* {tg_location}"
+        f"{travel_line}\n\n"
+    )
+    message = _fit_to_telegram(header, email_preview, reply_preview)
+    keyboard = [
+        [
+            {"text": "✅ Send", "callback_data": f"send:{approval_id}"},
+            {"text": "✏️ Edit & Send", "callback_data": f"edit:{approval_id}"},
+            {"text": "🗑️ Discard", "callback_data": f"discard:{approval_id}"},
+        ],
+    ]
+    return message, keyboard
+
+
+def build_general_tg_message(approval_id):
+    """Build the Telegram message text and keyboard for a general email approval item."""
+    item = pending_approvals.get(approval_id)
+    if not item:
+        return None, None
+    email = item["email"]
+    reply_text = item["reply_text"]
+
+    sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
+    tg_subject = _tg_escape(email["subject"])
+    reply_preview = _tg_escape(reply_text[:1500] + ("..." if len(reply_text) > 1500 else ""))
+    _email_body_gen = _strip_quoted_reply(email["body"]).strip()
+    email_preview = _tg_escape(_email_body_gen[:2000] + ("..." if len(_email_body_gen) > 2000 else ""))
+
+    to_header = email.get("to", "")
+    group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
+
+    header = (
+        f"✏️ *Re-drafted*\n\n"
+        f"{group_note}"
+        f"📧 *New email*\n"
+        f"*From:* {sender_name}\n"
+        f"*Subject:* {tg_subject}\n\n"
+    )
+    message = _fit_to_telegram(header, email_preview, reply_preview)
+    keyboard = [
+        [
+            {"text": "✅ Send", "callback_data": f"gen_send:{approval_id}"},
+            {"text": "✏️ Edit & Send", "callback_data": f"gen_edit:{approval_id}"},
+            {"text": "🗑️ Discard", "callback_data": f"gen_discard:{approval_id}"},
+        ],
+    ]
+    return message, keyboard
+
+
 def process_email(email):
     """Full pipeline: classify → extract → travel → draft → queue for approval."""
     print(f"\nProcessing email: {email['subject']} from {email['sender']}")
@@ -1239,6 +1319,7 @@ def process_email(email):
             if tg_msg_id:
                 pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
                 pending_approvals[f"tg:{tg_msg_id}"] = approval_id
+                pending_approvals[f"tgorig:{tg_msg_id}"] = approval_id
     else:
         # Open approval UI in browser (on Mac)
         url = f"http://localhost:5002/approve/{approval_id}"
@@ -1249,6 +1330,7 @@ def process_email(email):
         if tg_msg_id:
             pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
             pending_approvals[f"tg:{tg_msg_id}"] = approval_id
+            pending_approvals[f"tgorig:{tg_msg_id}"] = approval_id
             save_pending_approvals()
 
 
@@ -1371,6 +1453,51 @@ INSTRUCTIONS:
     return response.content[0].text.strip()
 
 
+def redraft_with_notes(item, notes):
+    """
+    Re-draft a reply based on user feedback notes.
+    Works for both meeting and general emails.
+    item: the pending_approvals entry (has 'email', 'reply_text', optionally 'meeting_details')
+    notes: plain-text instructions from the user (e.g. "make time 8:00, more professional tone")
+    """
+    email = item["email"]
+    current_draft = item.get("reply_text", "")
+    fetched_examples = get_style_examples()
+    lang = _detect_language(email.get("body", ""))
+    lang_hint = "The email is in Dutch — reply in Dutch and prioritise Dutch style examples above.\n" if lang == "nl" else ""
+
+    prompt = f"""You are drafting an email reply on behalf of Edouard Schneiders, Co-founder of CaraOmics.
+{fetched_examples}
+{lang_hint}Write in Edouard's voice exactly as shown in the examples above.
+
+Original email:
+Subject: {email['subject']}
+From: {email['sender']}
+Body:
+{email['body'][:2000]}
+
+Current draft:
+{current_draft}
+
+Edouard's feedback / revision instructions:
+{notes}
+
+INSTRUCTIONS:
+- Apply Edouard's feedback to revise the draft
+- Keep his voice, tone, and sign-off style from the examples
+- Reply in the SAME LANGUAGE as the original email
+- Do NOT include a subject line, only the email body
+- Keep it concise — max 150 words
+"""
+
+    response = get_anthropic_client().messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
 def process_general_email(email):
     """Pipeline for non-meeting emails: draft reply → queue → notify via general bot."""
     print(f"\n[General] Processing email: {email['subject']} from {email['sender']}")
@@ -1436,11 +1563,13 @@ def process_general_email(email):
             if tg_msg_id:
                 pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
                 pending_approvals[f"gentg:{tg_msg_id}"] = approval_id
+                pending_approvals[f"gentgorig:{tg_msg_id}"] = approval_id
     else:
         tg_msg_id = send_general_telegram(message, keyboard)
         if tg_msg_id:
             pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
             pending_approvals[f"gentg:{tg_msg_id}"] = approval_id
+            pending_approvals[f"gentgorig:{tg_msg_id}"] = approval_id
             save_pending_approvals()
 
 
