@@ -455,7 +455,7 @@ def _handle_telegram_update(update, token):
                 pending_approvals[approval_id]["reply_text"] = new_draft
                 pending_approvals[approval_id]["status"] = "pending"
                 save_pending_approvals()
-                message, keyboard = build_meeting_tg_message(approval_id)
+                message, keyboard = build_meeting_tg_message(approval_id, is_redraft=False)
                 draft_msg_id = send_telegram(message, keyboard)
                 if draft_msg_id:
                     pending_approvals[approval_id]["draft_telegram_message_id"] = draft_msg_id
@@ -477,7 +477,7 @@ def _handle_telegram_update(update, token):
                 new_draft = redraft_with_notes(item, text)
                 pending_approvals[approval_id]["reply_text"] = new_draft
                 save_pending_approvals()
-                message, keyboard = build_meeting_tg_message(approval_id)
+                message, keyboard = build_meeting_tg_message(approval_id, is_redraft=True)
                 edit_telegram_message(replied_msg_id, message, keyboard)
             except Exception as e:
                 send_telegram(f"❌ Re-draft error: {str(e)}")
@@ -552,6 +552,7 @@ def _handle_telegram_update(update, token):
                 send_telegram(f"📅 Calendar event created{invite_str}!{meet_str}{date_warn}\n[Open event]({cal_link})")
             except Exception as e:
                 send_telegram(f"❌ Calendar error: {str(e)}")
+        return  # handled by tgcal: — don't fall through to general handler
 
     # ── Also handle gen_* callbacks and gentg/gentgorig/gentgdraft messages ─
     _handle_general_telegram_update(update, token)
@@ -668,7 +669,7 @@ def _handle_general_telegram_update(update, token):
                 pending_approvals[approval_id]["reply_text"] = new_draft
                 pending_approvals[approval_id]["status"] = "pending"
                 save_pending_approvals()
-                message, keyboard = build_general_tg_message(approval_id)
+                message, keyboard = build_general_tg_message(approval_id, is_redraft=False)
                 draft_msg_id = send_general_telegram(message, keyboard)
                 if draft_msg_id:
                     pending_approvals[approval_id]["draft_telegram_message_id"] = draft_msg_id
@@ -690,7 +691,7 @@ def _handle_general_telegram_update(update, token):
                 new_draft = redraft_with_notes(item, text)
                 pending_approvals[approval_id]["reply_text"] = new_draft
                 save_pending_approvals()
-                message, keyboard = build_general_tg_message(approval_id)
+                message, keyboard = build_general_tg_message(approval_id, is_redraft=True)
                 edit_general_telegram_message(replied_msg_id, message, keyboard)
             except Exception as e:
                 send_general_telegram(f"❌ Re-draft error: {str(e)}")

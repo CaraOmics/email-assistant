@@ -352,6 +352,8 @@ _AUTOMATED_SENDER_PATTERNS = re.compile(
     r"(noreply|no-reply|no\.reply|donotreply|do-not-reply|"
     r"mailer-daemon|postmaster|bounce|notifications?@|"
     r"alerts?@|newsletter|@mailchimp|@sendgrid|@hubspot|"
+    r"@klaviyo|@substack|@beehiiv|@constantcontact|@campaignmonitor|"
+    r"@mail\.(masterclass|medium|substack)|"
     r"@linkedin\.com|@twitter\.com|@facebook\.com|"
     r"automatisch|automated|support-noreply)",
     re.IGNORECASE,
@@ -392,9 +394,15 @@ def _fit_to_telegram(header: str, email_body: str, reply: str) -> str:
 
 
 def is_automated_sender(email):
-    """Return True if the email looks like it came from an automated system."""
+    """Return True if the email looks like it came from an automated system or is a newsletter."""
     sender = email.get("sender", "")
-    return bool(_AUTOMATED_SENDER_PATTERNS.search(sender))
+    if _AUTOMATED_SENDER_PATTERNS.search(sender):
+        return True
+    # Newsletters and marketing emails always contain an unsubscribe link
+    body = email.get("body", "").lower()
+    if "unsubscribe" in body:
+        return True
+    return False
 
 
 _NL_STOPWORDS = {"de", "het", "een", "van", "en", "dat", "is", "op", "te", "in", "je", "ik",
@@ -1103,7 +1111,7 @@ def send_telegram(message, keyboard=None):
         return None
 
 
-def build_meeting_tg_message(approval_id):
+def build_meeting_tg_message(approval_id, is_redraft=False):
     """Build the Telegram message text and keyboard for a meeting approval item."""
     item = pending_approvals.get(approval_id)
     if not item:
@@ -1127,8 +1135,9 @@ def build_meeting_tg_message(approval_id):
     to_header = email.get("to", "")
     group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
 
+    draft_label = "↻ *Re\\-drafted*" if is_redraft else "✏️ *Draft*"
     header = (
-        f"✏️ *Re-drafted*\n\n"
+        f"{draft_label}\n\n"
         f"{group_note}"
         f"📬 *New meeting request*\n"
         f"*From:* {sender_name}\n"
@@ -1148,7 +1157,7 @@ def build_meeting_tg_message(approval_id):
     return message, keyboard
 
 
-def build_general_tg_message(approval_id):
+def build_general_tg_message(approval_id, is_redraft=False):
     """Build the Telegram message text and keyboard for a general email approval item."""
     item = pending_approvals.get(approval_id)
     if not item:
@@ -1165,8 +1174,9 @@ def build_general_tg_message(approval_id):
     to_header = email.get("to", "")
     group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
 
+    draft_label = "↻ *Re\\-drafted*" if is_redraft else "✏️ *Draft*"
     header = (
-        f"✏️ *Re-drafted*\n\n"
+        f"{draft_label}\n\n"
         f"{group_note}"
         f"📧 *New email*\n"
         f"*From:* {sender_name}\n"
