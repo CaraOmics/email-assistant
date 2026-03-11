@@ -1197,15 +1197,13 @@ def build_general_tg_message(approval_id):
 
 
 def process_email(email):
-    """Full pipeline: classify → extract → travel → draft → queue for approval."""
+    """Notify about incoming email — no auto-draft. User replies with instructions to draft."""
     print(f"\nProcessing email: {email['subject']} from {email['sender']}")
 
-    # Skip emails where Edouard is only CC'd — someone else is the primary recipient
     if email.get("cc_only"):
-        print("  → Edouard is CC'd only, skipping (not directly addressed).")
+        print("  → Edouard is CC'd only, skipping.")
         return
 
-    # Skip automated senders (newsletters, notifications, no-reply, etc.)
     if is_automated_sender(email):
         print(f"  → Automated sender detected, skipping: {email['sender']}")
         return
@@ -1216,115 +1214,43 @@ def process_email(email):
         return
 
     print("  → Meeting email detected!")
-    meeting_details = extract_meeting_details(email)
-    # Resolve relative dates ("next Wednesday") to ISO dates before calendar check
-    if meeting_details.get("proposed_date"):
-        meeting_details["proposed_date"] = resolve_proposed_date(meeting_details["proposed_date"])
-    print(f"  → Details: {meeting_details}")
-
-    location = meeting_details.get("location")
-    travel_info = get_travel_time(location) if location else None
-    travel_minutes = travel_info["duration_minutes"] if travel_info else 0
-    if travel_info:
-        print(f"  → Travel time: {travel_info['duration_text']}")
-
-    # Get verified free slots from Python — no Claude calendar reasoning
-    meeting_type = meeting_details.get("meeting_type", "")
-    is_long_distance = travel_minutes > 60 and meeting_type not in ["video call", "phone call"]
-
-    free_slots = get_free_slots(
-        duration_minutes=meeting_details.get("duration_minutes", 60),
-        travel_minutes=travel_minutes if is_long_distance else 0,
-        is_long_distance=is_long_distance,
-    )
-
-    thread_messages = get_email_thread(email["thread_id"])
-    reply_text = draft_reply(email, meeting_details, travel_info, free_slots, thread_messages)
-    print(f"  → Draft reply created ({len(reply_text)} chars)")
-
-    # Check if we already have a pending approval for this thread
     thread_id = email["thread_id"]
     existing_id = pending_approvals.get(f"thread:{thread_id}")
     existing_item = pending_approvals.get(existing_id) if existing_id else None
 
-    if existing_item and existing_item.get("status") == "pending":
-        # Update the existing approval with the latest email + fresh draft
-        print(f"  → Thread already pending — updating existing Telegram message.")
+    if existing_item and existing_item.get("status") in ("awaiting_instructions", "pending"):
         existing_item["email"] = email
-        existing_item["meeting_details"] = meeting_details
-        existing_item["travel_info"] = travel_info
-        existing_item["reply_text"] = reply_text
         approval_id = existing_id
     else:
         approval_id = email["id"]
         pending_approvals[approval_id] = {
             "email": email,
-            "meeting_details": meeting_details,
-            "travel_info": travel_info,
-            "reply_text": reply_text,
-            "status": "pending",
+            "status": "awaiting_instructions",
         }
-        # Index by thread_id for future follow-up detection
         pending_approvals[f"thread:{thread_id}"] = approval_id
         save_pending_approvals()
 
-    # Build Telegram message content
     sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
-    tg_location = _tg_escape(meeting_details.get("location") or "Not specified")
-    proposed_date = _tg_escape(meeting_details.get("proposed_date") or "Not specified")
-    proposed_time = _tg_escape(meeting_details.get("proposed_time") or "")
     tg_subject = _tg_escape(email["subject"])
-    travel_line = ""
-    if travel_info:
-        travel_line = f"\n🚆 *Travel:* {travel_info['duration_text']} from Amsterdam Zuid"
-
-    reply_preview = _tg_escape(reply_text[:1500] + ("..." if len(reply_text) > 1500 else ""))
     _email_body = _strip_quoted_reply(email["body"]).strip()
-    email_preview = _tg_escape(_email_body[:2000] + ("..." if len(_email_body) > 2000 else ""))
-
-    updated_note = "↻ *Draft updated — new message in thread*\n\n" if (existing_item and existing_item.get("status") == "pending") else ""
-
-    # Warn if this is a group thread (multiple people in To:)
+    email_preview = _tg_escape(_email_body[:3000] + ("..." if len(_email_body) > 3000 else ""))
     to_header = email.get("to", "")
     group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
 
-    header = (
-        f"{updated_note}"
+    message = (
         f"{group_note}"
-        f"📬 *New meeting request*\n"
+        f"📬 *New meeting email*\n"
         f"*From:* {sender_name}\n"
-        f"*Subject:* {tg_subject}\n"
-        f"*Date:* {proposed_date} {proposed_time}\n"
-        f"*Location:* {tg_location}"
-        f"{travel_line}\n\n"
+        f"*Subject:* {tg_subject}\n\n"
+        f"{email_preview}\n\n"
+        f"_Reply with instructions to draft a reply_"
     )
-    message = _fit_to_telegram(header, email_preview, reply_preview)
-
-    keyboard = [
-        [
-            {"text": "✅ Send", "callback_data": f"send:{approval_id}"},
-            {"text": "✏️ Edit & Send", "callback_data": f"edit:{approval_id}"},
-            {"text": "🗑️ Discard", "callback_data": f"discard:{approval_id}"},
-        ],
-    ]
+    keyboard = [[{"text": "🗑️ Discard", "callback_data": f"discard:{approval_id}"}]]
 
     existing_tg_msg_id = pending_approvals.get(approval_id, {}).get("telegram_message_id") if existing_item else None
-
     if existing_tg_msg_id:
-        # Edit the existing Telegram message in place
-        edited = edit_telegram_message(existing_tg_msg_id, message, keyboard)
-        if not edited:
-            # Fall back to sending a new message if edit fails
-            tg_msg_id = send_telegram(message, keyboard)
-            if tg_msg_id:
-                pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
-                pending_approvals[f"tgorig:{tg_msg_id}"] = approval_id
+        edit_telegram_message(existing_tg_msg_id, message, keyboard)
     else:
-        # Open approval UI in browser (on Mac)
-        url = f"http://localhost:5002/approve/{approval_id}"
-        print(f"  → Opening approval UI: {url}")
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-
         tg_msg_id = send_telegram(message, keyboard)
         if tg_msg_id:
             pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
@@ -1496,30 +1422,66 @@ INSTRUCTIONS:
     return response.content[0].text.strip()
 
 
+def draft_from_instructions(item, instructions):
+    """
+    Draft a reply from scratch based on user instructions.
+    Called when the user replies to the initial email notification.
+    item: pending_approvals entry with 'email'
+    instructions: user's plain-text instructions
+    """
+    email = item["email"]
+    fetched_examples = get_style_examples()
+    lang = _detect_language(email.get("body", ""))
+    lang_hint = "The email is in Dutch — reply in Dutch and prioritise Dutch style examples above.\n" if lang == "nl" else ""
+    now_str = datetime.now().strftime("%A %B %d, %Y")
+
+    prompt = f"""You are drafting an email reply on behalf of Edouard Schneiders, Co-founder of CaraOmics.
+{fetched_examples}
+{lang_hint}Write in Edouard's voice exactly as shown in the examples above.
+
+TODAY is {now_str}.
+
+Original email:
+Subject: {email['subject']}
+From: {email['sender']}
+Body:
+{email['body'][:2000]}
+
+Edouard's instructions for this reply:
+{instructions}
+
+INSTRUCTIONS:
+- Follow Edouard's instructions above precisely
+- Write in his voice, tone, greeting style, and sign-off as shown in the examples
+- Reply in the SAME LANGUAGE as the original email
+- Do NOT include a subject line, only the email body
+- Keep it concise — max 150 words
+"""
+
+    response = get_anthropic_client().messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
 def process_general_email(email):
-    """Pipeline for non-meeting emails: draft reply → queue → notify via general bot."""
+    """Notify about incoming general email — no auto-draft. User replies with instructions."""
     print(f"\n[General] Processing email: {email['subject']} from {email['sender']}")
 
-    thread_messages = get_email_thread(email["thread_id"])
-    reply_text = draft_general_reply(email, thread_messages=thread_messages)
-    print(f"  → General draft created ({len(reply_text)} chars)")
-
-    # Check if we already have a pending approval for this thread
     thread_id = email["thread_id"]
     existing_id = pending_approvals.get(f"genthread:{thread_id}")
     existing_item = pending_approvals.get(existing_id) if existing_id else None
 
-    if existing_item and existing_item.get("status") == "pending":
-        print(f"  → Thread already pending — updating existing Telegram message.")
+    if existing_item and existing_item.get("status") in ("awaiting_instructions", "pending"):
         existing_item["email"] = email
-        existing_item["reply_text"] = reply_text
         approval_id = existing_id
     else:
         approval_id = f"gen:{email['id']}"
         pending_approvals[approval_id] = {
             "email": email,
-            "reply_text": reply_text,
-            "status": "pending",
+            "status": "awaiting_instructions",
             "type": "general",
         }
         pending_approvals[f"genthread:{thread_id}"] = approval_id
@@ -1527,40 +1489,24 @@ def process_general_email(email):
 
     sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
     tg_subject = _tg_escape(email["subject"])
-    reply_preview = _tg_escape(reply_text[:1500] + ("..." if len(reply_text) > 1500 else ""))
     _email_body_gen = _strip_quoted_reply(email["body"]).strip()
-    email_preview = _tg_escape(_email_body_gen[:2000] + ("..." if len(_email_body_gen) > 2000 else ""))
-    updated_note = "↻ *Draft updated — new message in thread*\n\n" if (existing_item and existing_item.get("status") == "pending") else ""
-
+    email_preview = _tg_escape(_email_body_gen[:3000] + ("..." if len(_email_body_gen) > 3000 else ""))
     to_header = email.get("to", "")
     group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
 
-    header = (
-        f"{updated_note}"
+    message = (
         f"{group_note}"
         f"📧 *New email*\n"
         f"*From:* {sender_name}\n"
         f"*Subject:* {tg_subject}\n\n"
+        f"{email_preview}\n\n"
+        f"_Reply with instructions to draft a reply_"
     )
-    message = _fit_to_telegram(header, email_preview, reply_preview)
-
-    keyboard = [
-        [
-            {"text": "✅ Send", "callback_data": f"gen_send:{approval_id}"},
-            {"text": "✏️ Edit & Send", "callback_data": f"gen_edit:{approval_id}"},
-            {"text": "🗑️ Discard", "callback_data": f"gen_discard:{approval_id}"},
-        ],
-    ]
+    keyboard = [[{"text": "🗑️ Discard", "callback_data": f"gen_discard:{approval_id}"}]]
 
     existing_tg_msg_id = pending_approvals.get(approval_id, {}).get("telegram_message_id") if existing_item else None
-
     if existing_tg_msg_id:
-        edited = edit_general_telegram_message(existing_tg_msg_id, message, keyboard)
-        if not edited:
-            tg_msg_id = send_general_telegram(message, keyboard)
-            if tg_msg_id:
-                pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
-                pending_approvals[f"gentgorig:{tg_msg_id}"] = approval_id
+        edit_general_telegram_message(existing_tg_msg_id, message, keyboard)
     else:
         tg_msg_id = send_general_telegram(message, keyboard)
         if tg_msg_id:
