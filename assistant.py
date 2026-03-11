@@ -565,9 +565,10 @@ def build_calendar_json_preview(meeting_details, email):
     sender_name = email["sender"].split("<")[0].strip() or email["sender"]
     title = meeting_details.get("topic") or f"Meeting with {sender_name}"
 
+    date_default = datetime.now().strftime("%Y-%m-DD")
     return json.dumps({
         "title": title,
-        "date": meeting_details.get("proposed_date") or "YYYY-MM-DD",
+        "date": meeting_details.get("proposed_date") or date_default,
         "time": meeting_details.get("proposed_time") or "HH:MM",
         "duration_minutes": meeting_details.get("duration_minutes", 60),
         "location": meeting_details.get("location") or "",
