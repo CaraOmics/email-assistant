@@ -85,6 +85,60 @@ def _strip_quoted_reply(body):
     return "\n".join(clean).strip()
 
 
+def _llm_filter_and_clean(email):
+    """
+    Uses Claude Haiku to:
+    1. Decide if this email needs Edouard's personal response (YES/NO)
+    2. If YES, extract just the main message body — strip footers, disclaimers,
+       hyperlink-only lines, legal text, and other noise.
+
+    Returns (should_notify: bool, clean_body: str).
+    On any error, defaults to (True, raw_body) so nothing is silently dropped.
+    """
+    raw_body = _strip_quoted_reply(email.get("body", "")).strip()
+    body_snippet = raw_body[:2000]
+
+    prompt = f"""You are filtering emails for Edouard Schneiders, CEO of Caraomics (biotech startup).
+
+Decide if this email needs Edouard's personal response.
+
+Reply NO for: newsletters, automated notifications, calendar invites, order confirmations, receipts, cold sales/marketing outreach, LinkedIn/social notifications, group announcements, or anything that does not expect a direct personal reply from Edouard.
+Reply YES for: emails from real people asking a question, requesting a meeting, following up on a conversation, or clearly expecting a personal response.
+
+If YES, also extract only the main human-written message — remove email footers, legal disclaimers, confidentiality notices, unsubscribe text, lines that are only hyperlinks, excessive blank lines, and signature boilerplate.
+
+From: {email['sender']}
+Subject: {email['subject']}
+Body:
+{body_snippet}
+
+Respond in EXACTLY this format (no extra text):
+DECISION: YES
+CLEAN_BODY: <main message only, max 600 chars>
+
+or:
+DECISION: NO"""
+
+    try:
+        response = get_anthropic_client().messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=700,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("DECISION: NO"):
+            return False, ""
+        # Extract clean body
+        if "CLEAN_BODY:" in text:
+            clean_body = text.split("CLEAN_BODY:", 1)[1].strip()
+        else:
+            clean_body = raw_body
+        return True, clean_body
+    except Exception as e:
+        print(f"  → LLM filter error (defaulting to notify): {e}")
+        return True, raw_body
+
+
 def get_style_examples(force_refresh=False):
     """
     Fetch up to 10 best style examples from Edouard's sent emails.
@@ -1213,6 +1267,12 @@ def process_email(email):
         return
 
     print("  → Meeting email detected!")
+
+    should_notify, clean_body = _llm_filter_and_clean(email)
+    if not should_notify:
+        print(f"  → LLM filter: skipping (not worth notifying)")
+        return
+
     thread_id = email["thread_id"]
     existing_id = pending_approvals.get(f"thread:{thread_id}")
     existing_item = pending_approvals.get(existing_id) if existing_id else None
@@ -1231,8 +1291,7 @@ def process_email(email):
 
     sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
     tg_subject = _tg_escape(email["subject"])
-    _email_body = _strip_quoted_reply(email["body"]).strip()
-    email_preview = _tg_escape(_email_body[:3000] + ("..." if len(_email_body) > 3000 else ""))
+    email_preview = _tg_escape(clean_body[:3000] + ("..." if len(clean_body) > 3000 else ""))
     to_header = email.get("to", "")
     group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
 
@@ -1432,6 +1491,11 @@ def process_general_email(email):
     """Notify about incoming general email — no auto-draft. User replies with instructions."""
     print(f"\n[General] Processing email: {email['subject']} from {email['sender']}")
 
+    should_notify, clean_body = _llm_filter_and_clean(email)
+    if not should_notify:
+        print(f"  → LLM filter: skipping (not worth notifying)")
+        return
+
     thread_id = email["thread_id"]
     existing_id = pending_approvals.get(f"genthread:{thread_id}")
     existing_item = pending_approvals.get(existing_id) if existing_id else None
@@ -1451,8 +1515,7 @@ def process_general_email(email):
 
     sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
     tg_subject = _tg_escape(email["subject"])
-    _email_body_gen = _strip_quoted_reply(email["body"]).strip()
-    email_preview = _tg_escape(_email_body_gen[:3000] + ("..." if len(_email_body_gen) > 3000 else ""))
+    email_preview = _tg_escape(clean_body[:3000] + ("..." if len(clean_body) > 3000 else ""))
     to_header = email.get("to", "")
     group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
 
