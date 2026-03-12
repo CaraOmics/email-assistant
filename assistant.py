@@ -9,6 +9,7 @@ import time
 import base64
 import json
 import re
+import sqlite3
 import threading
 import webbrowser
 from datetime import datetime, timezone
@@ -31,7 +32,8 @@ BASE_LOCATION = os.getenv("BASE_LOCATION", "Amsterdam Zuid station, Amsterdam, N
 WORK_EMAIL = os.getenv("WORK_EMAIL")
 CALENDAR_ID = os.getenv("CALENDAR_ID")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", 60))
-APPROVALS_FILE = os.path.join(_DIR, "pending_approvals.json")
+DB_FILE = os.path.join(_DIR, "email_assistant.db")
+_LEGACY_JSON = os.path.join(_DIR, "pending_approvals.json")
 
 def get_anthropic_client():
     """Create Anthropic client fresh, always reading from .env."""
@@ -42,23 +44,118 @@ def get_anthropic_client():
             return anthropic.Anthropic(api_key=api_key)
     raise ValueError("EMAIL_ASSISTANT_ANTHROPIC_KEY not found in .env")
 
-# In-memory store for pending approvals (shared with Flask app)
-# Persisted to disk so items survive server restarts
+# ── Persistence (SQLite) ──────────────────────────────────────────────────────
+_db_lock = threading.Lock()
+
+def _db_init():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS approvals (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS filtered_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender      TEXT NOT NULL,
+                subject     TEXT NOT NULL,
+                stage       TEXT NOT NULL,
+                filtered_at REAL NOT NULL
+            )
+        """)
+        conn.commit()
+
+
 def _load_pending_approvals():
-    if os.path.exists(APPROVALS_FILE):
+    _db_init()
+    # One-time migration from legacy JSON
+    if os.path.exists(_LEGACY_JSON):
         try:
-            with open(APPROVALS_FILE) as f:
-                return json.load(f)
+            with open(_LEGACY_JSON) as f:
+                legacy = json.load(f)
+            with _db_lock:
+                with sqlite3.connect(DB_FILE) as conn:
+                    for k, v in legacy.items():
+                        conn.execute(
+                            "INSERT OR IGNORE INTO approvals (key, value) VALUES (?, ?)",
+                            (k, json.dumps(v, default=str)),
+                        )
+                    conn.commit()
+            os.rename(_LEGACY_JSON, _LEGACY_JSON + ".migrated")
+            print(f"  → Migrated {len(legacy)} items from JSON to SQLite.")
+            return legacy
         except Exception as e:
-            print(f"  → Could not load pending_approvals.json: {e}")
-    return {}
+            print(f"  → JSON migration error (continuing): {e}")
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            rows = conn.execute("SELECT key, value FROM approvals").fetchall()
+        result = {}
+        for k, v in rows:
+            try:
+                result[k] = json.loads(v)
+            except Exception:
+                result[k] = v
+        return result
+    except Exception as e:
+        print(f"  → Could not load from SQLite: {e}")
+        return {}
+
 
 def save_pending_approvals():
+    """Persist the in-memory pending_approvals dict to SQLite."""
     try:
-        with open(APPROVALS_FILE, "w") as f:
-            json.dump(pending_approvals, f, indent=2, default=str)
+        now = time.time()
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                for key, value in pending_approvals.items():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO approvals (key, value) VALUES (?, ?)",
+                        (key, json.dumps(value, default=str)),
+                    )
+                conn.commit()
     except Exception as e:
-        print(f"  → Could not save pending_approvals.json: {e}")
+        print(f"  → Could not save to SQLite: {e}")
+
+
+def log_filtered_email(email, stage):
+    """Log a skipped email to filtered_log. stage: 'automated_sender' or 'llm_filter'."""
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute(
+                    "INSERT INTO filtered_log (sender, subject, stage, filtered_at) VALUES (?, ?, ?, ?)",
+                    (email.get("sender", ""), email.get("subject", ""), stage, time.time()),
+                )
+                conn.commit()
+    except Exception as e:
+        print(f"  → log_filtered_email error: {e}")
+
+
+def send_daily_digest():
+    """Send a Telegram summary of emails filtered in the last 24 hours."""
+    try:
+        since = time.time() - 86400
+        with sqlite3.connect(DB_FILE) as conn:
+            rows = conn.execute(
+                "SELECT sender, subject, stage FROM filtered_log "
+                "WHERE filtered_at > ? ORDER BY filtered_at DESC",
+                (since,),
+            ).fetchall()
+        if not rows:
+            send_telegram("📋 *Daily digest:* No emails were filtered in the last 24 hours.")
+            return
+        lines = [f"📋 *Daily digest* — {len(rows)} email(s) filtered in the last 24h:\n"]
+        for sender, subject, stage in rows[:30]:
+            tag = "🤖 auto" if stage == "automated_sender" else "🧠 LLM"
+            s = _tg_escape(sender.split("<")[0].strip()[:30] or sender[:30])
+            subj = _tg_escape(subject[:50])
+            lines.append(f"{tag} — *{s}*: _{subj}_")
+        send_telegram("\n".join(lines))
+    except Exception as e:
+        print(f"  → send_daily_digest error: {e}")
+
 
 pending_approvals = _load_pending_approvals()
 
@@ -1167,8 +1264,8 @@ def send_telegram(message, keyboard=None):
         return None
 
 
-def build_meeting_tg_message(approval_id, is_redraft=False):
-    """Build the Telegram message text and keyboard for a meeting approval item."""
+def build_tg_message(approval_id, is_redraft=False):
+    """Build the Telegram message text and keyboard for any email approval item."""
     item = pending_approvals.get(approval_id)
     if not item:
         return None, None
@@ -1176,32 +1273,42 @@ def build_meeting_tg_message(approval_id, is_redraft=False):
     reply_text = item["reply_text"]
     meeting_details = item.get("meeting_details") or {}
     travel_info = item.get("travel_info")
+    is_meeting = bool(meeting_details)
 
     sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
-    tg_location = _tg_escape(meeting_details.get("location") or "Not specified")
-    proposed_date = _tg_escape(meeting_details.get("proposed_date") or "Not specified")
-    proposed_time = _tg_escape(meeting_details.get("proposed_time") or "")
     tg_subject = _tg_escape(email["subject"])
-    travel_line = f"\n🚆 *Travel:* {travel_info['duration_text']} from Amsterdam Zuid" if travel_info else ""
-
     reply_preview = _tg_escape(reply_text[:1500] + ("..." if len(reply_text) > 1500 else ""))
     _email_body = _strip_quoted_reply(email["body"]).strip()
     email_preview = _tg_escape(_email_body[:2000] + ("..." if len(_email_body) > 2000 else ""))
 
     to_header = email.get("to", "")
     group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
-
     draft_label = "↻ *Re\\-drafted*" if is_redraft else "✏️ *Draft*"
-    header = (
-        f"{draft_label}\n\n"
-        f"{group_note}"
-        f"📬 *New meeting request*\n"
-        f"*From:* {sender_name}\n"
-        f"*Subject:* {tg_subject}\n"
-        f"*Date:* {proposed_date} {proposed_time}\n"
-        f"*Location:* {tg_location}"
-        f"{travel_line}\n\n"
-    )
+
+    if is_meeting:
+        tg_location = _tg_escape(meeting_details.get("location") or "Not specified")
+        proposed_date = _tg_escape(meeting_details.get("proposed_date") or "Not specified")
+        proposed_time = _tg_escape(meeting_details.get("proposed_time") or "")
+        travel_line = f"\n🚆 *Travel:* {travel_info['duration_text']} from Amsterdam Zuid" if travel_info else ""
+        header = (
+            f"{draft_label}\n\n"
+            f"{group_note}"
+            f"📬 *New meeting request*\n"
+            f"*From:* {sender_name}\n"
+            f"*Subject:* {tg_subject}\n"
+            f"*Date:* {proposed_date} {proposed_time}\n"
+            f"*Location:* {tg_location}"
+            f"{travel_line}\n\n"
+        )
+    else:
+        header = (
+            f"{draft_label}\n\n"
+            f"{group_note}"
+            f"📧 *New email*\n"
+            f"*From:* {sender_name}\n"
+            f"*Subject:* {tg_subject}\n\n"
+        )
+
     message = _fit_to_telegram(header, email_preview, reply_preview)
     keyboard = [
         [
@@ -1213,40 +1320,12 @@ def build_meeting_tg_message(approval_id, is_redraft=False):
     return message, keyboard
 
 
+# Backward-compat aliases (kept for any external callers)
+def build_meeting_tg_message(approval_id, is_redraft=False):
+    return build_tg_message(approval_id, is_redraft)
+
 def build_general_tg_message(approval_id, is_redraft=False):
-    """Build the Telegram message text and keyboard for a general email approval item."""
-    item = pending_approvals.get(approval_id)
-    if not item:
-        return None, None
-    email = item["email"]
-    reply_text = item["reply_text"]
-
-    sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
-    tg_subject = _tg_escape(email["subject"])
-    reply_preview = _tg_escape(reply_text[:1500] + ("..." if len(reply_text) > 1500 else ""))
-    _email_body_gen = _strip_quoted_reply(email["body"]).strip()
-    email_preview = _tg_escape(_email_body_gen[:2000] + ("..." if len(_email_body_gen) > 2000 else ""))
-
-    to_header = email.get("to", "")
-    group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
-
-    draft_label = "↻ *Re\\-drafted*" if is_redraft else "✏️ *Draft*"
-    header = (
-        f"{draft_label}\n\n"
-        f"{group_note}"
-        f"📧 *New email*\n"
-        f"*From:* {sender_name}\n"
-        f"*Subject:* {tg_subject}\n\n"
-    )
-    message = _fit_to_telegram(header, email_preview, reply_preview)
-    keyboard = [
-        [
-            {"text": "✅ Send", "callback_data": f"gen_send:{approval_id}"},
-            {"text": "✏️ Edit & Send", "callback_data": f"gen_edit:{approval_id}"},
-            {"text": "🗑️ Discard", "callback_data": f"gen_discard:{approval_id}"},
-        ],
-    ]
-    return message, keyboard
+    return build_tg_message(approval_id, is_redraft)
 
 
 def process_email(email):
@@ -1255,19 +1334,18 @@ def process_email(email):
 
     if is_automated_sender(email):
         print(f"  → Automated sender detected, skipping: {email['sender']}")
+        log_filtered_email(email, "automated_sender")
         return
-
-    if not is_meeting_related(email):
-        print("  → Not meeting-related, routing to general email bot.")
-        process_general_email(email)
-        return
-
-    print("  → Meeting email detected!")
 
     should_notify, clean_body = _llm_filter_and_clean(email)
     if not should_notify:
         print(f"  → LLM filter: skipping (not worth notifying)")
+        log_filtered_email(email, "llm_filter")
         return
+
+    meeting_related = is_meeting_related(email)
+    icon = "📬" if meeting_related else "📧"
+    email_type = "meeting email" if meeting_related else "email"
 
     thread_id = email["thread_id"]
     existing_id = pending_approvals.get(f"thread:{thread_id}")
@@ -1281,6 +1359,7 @@ def process_email(email):
         pending_approvals[approval_id] = {
             "email": email,
             "status": "awaiting_instructions",
+            "type": "meeting" if meeting_related else "general",
         }
         pending_approvals[f"thread:{thread_id}"] = approval_id
         save_pending_approvals()
@@ -1293,7 +1372,7 @@ def process_email(email):
 
     message = (
         f"{group_note}"
-        f"📬 *New meeting email*\n"
+        f"{icon} *New {email_type}*\n"
         f"*From:* {sender_name}\n"
         f"*Subject:* {tg_subject}\n\n"
         f"{email_preview}\n\n"
@@ -1308,7 +1387,7 @@ def process_email(email):
         tg_msg_id = send_telegram(message, keyboard)
         if tg_msg_id:
             pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
-            pending_approvals[f"tgorig:{tg_msg_id}"] = approval_id
+            pending_approvals[f"orig:{tg_msg_id}"] = approval_id
             save_pending_approvals()
 
 
@@ -1452,12 +1531,25 @@ def draft_from_instructions(item, instructions):
     lang_hint = "The email is in Dutch — reply in Dutch and prioritise Dutch style examples above.\n" if lang == "nl" else ""
     now_str = datetime.now().strftime("%A %B %d, %Y")
 
+    # Fetch thread context: last 3 prior messages
+    thread_context = ""
+    thread_id = email.get("thread_id")
+    if thread_id:
+        thread_messages = get_email_thread(thread_id)
+        if len(thread_messages) > 1:
+            prior = thread_messages[:-1][-3:]  # last 3 before the current email
+            parts = []
+            for m in prior:
+                role = "You" if WORK_EMAIL and WORK_EMAIL.lower() in m.get("from", "").lower() else (m.get("from", "").split("<")[0].strip() or m.get("from", ""))
+                parts.append(f"[{m['date']}] {role}:\n{m['body'][:600]}")
+            thread_context = "\nThread history (earlier messages, most recent last):\n" + "\n\n---\n".join(parts) + "\n"
+
     prompt = f"""You are drafting an email reply on behalf of Edouard Schneiders, Co-founder of CaraOmics.
 {fetched_examples}
 {lang_hint}Write in Edouard's voice exactly as shown in the examples above.
 
 TODAY is {now_str}.
-
+{thread_context}
 Original email:
 Subject: {email['subject']}
 From: {email['sender']}
@@ -1483,72 +1575,35 @@ INSTRUCTIONS:
     return response.content[0].text.strip()
 
 
-def process_general_email(email):
-    """Notify about incoming general email — no auto-draft. User replies with instructions."""
-    print(f"\n[General] Processing email: {email['subject']} from {email['sender']}")
-
-    should_notify, clean_body = _llm_filter_and_clean(email)
-    if not should_notify:
-        print(f"  → LLM filter: skipping (not worth notifying)")
-        return
-
-    thread_id = email["thread_id"]
-    existing_id = pending_approvals.get(f"genthread:{thread_id}")
-    existing_item = pending_approvals.get(existing_id) if existing_id else None
-
-    if existing_item and existing_item.get("status") in ("awaiting_instructions", "pending"):
-        existing_item["email"] = email
-        approval_id = existing_id
-    else:
-        approval_id = f"gen:{email['id']}"
-        pending_approvals[approval_id] = {
-            "email": email,
-            "status": "awaiting_instructions",
-            "type": "general",
-        }
-        pending_approvals[f"genthread:{thread_id}"] = approval_id
-        save_pending_approvals()
-
-    sender_name = _tg_escape(email["sender"].split("<")[0].strip() or email["sender"])
-    tg_subject = _tg_escape(email["subject"])
-    email_preview = _tg_escape(clean_body[:3000] + ("..." if len(clean_body) > 3000 else ""))
-    to_header = email.get("to", "")
-    group_note = "👥 *Group thread — you may not need to reply*\n\n" if to_header.count("@") > 1 else ""
-
-    message = (
-        f"{group_note}"
-        f"📧 *New email*\n"
-        f"*From:* {sender_name}\n"
-        f"*Subject:* {tg_subject}\n\n"
-        f"{email_preview}\n\n"
-        f"_Reply with instructions to draft a reply_"
-    )
-    keyboard = [[{"text": "🗑️ Discard", "callback_data": f"gen_discard:{approval_id}"}]]
-
-    existing_tg_msg_id = pending_approvals.get(approval_id, {}).get("telegram_message_id") if existing_item else None
-    if existing_tg_msg_id:
-        edit_general_telegram_message(existing_tg_msg_id, message, keyboard)
-    else:
-        tg_msg_id = send_general_telegram(message, keyboard)
-        if tg_msg_id:
-            pending_approvals[approval_id]["telegram_message_id"] = tg_msg_id
-            pending_approvals[f"gentgorig:{tg_msg_id}"] = approval_id
-            save_pending_approvals()
-
-
 def poll_gmail():
     """Main polling loop."""
+    from zoneinfo import ZoneInfo
+    import google.auth.exceptions as _gauth_exc
+
+    AMS = ZoneInfo("Europe/Amsterdam")
     print(f"Email assistant started. Polling every {POLL_INTERVAL} seconds...")
     print(f"Base location: {BASE_LOCATION}")
     print(f"Work email: {WORK_EMAIL}")
 
-    service = get_gmail_service()
     last_check = datetime.now(timezone.utc)
+    last_digest_date = None
 
     while True:
         try:
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for new emails...")
-            emails = get_unread_meeting_emails(service, last_check)
+
+            try:
+                service = get_gmail_service()
+                emails = get_unread_meeting_emails(service, last_check)
+            except _gauth_exc.RefreshError as auth_err:
+                print(f"  → Google OAuth token expired: {auth_err}")
+                send_telegram(
+                    "⚠️ *Google OAuth token expired!*\n"
+                    "Re-run auth on your laptop and copy `token.json` to the server."
+                )
+                time.sleep(3600)
+                continue
+
             last_check = datetime.now(timezone.utc)
 
             if not emails:
@@ -1557,6 +1612,15 @@ def poll_gmail():
                 print(f"  Found {len(emails)} new email(s).")
                 for email in emails:
                     process_email(email)
+
+            # Daily digest at 8am Amsterdam time
+            now_ams = datetime.now(AMS)
+            if now_ams.hour == 8 and last_digest_date != now_ams.date():
+                last_digest_date = now_ams.date()
+                try:
+                    send_daily_digest()
+                except Exception as de:
+                    print(f"  → Digest error: {de}")
 
         except Exception as e:
             print(f"Error during poll: {e}")

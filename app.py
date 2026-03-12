@@ -10,11 +10,12 @@ from flask import Flask, render_template_string, request, jsonify
 
 from assistant import (
     pending_approvals, send_reply, create_calendar_event, poll_gmail,
-    send_general_telegram, get_email_thread, draft_general_reply,
+    send_telegram, get_email_thread,
     extract_meeting_details_from_reply,
     save_pending_approvals, build_calendar_json_preview, resolve_proposed_date,
-    edit_telegram_message, edit_general_telegram_message,
+    edit_telegram_message,
     _get_telegram_config,
+    build_tg_message,
 )
 
 app = Flask(__name__)
@@ -103,7 +104,7 @@ def base_html(title, content):
 
 @app.route("/")
 def index():
-    # Filter to only real approval items (skip tg: and gentg: index keys)
+    # Filter to only real approval items (skip reverse-lookup index keys)
     real_items = {
         aid: item for aid, item in pending_approvals.items()
         if isinstance(item, dict) and "email" in item
@@ -329,31 +330,10 @@ def _send_telegram_plain(token, text, chat_id=None, keyboard=None):
     return None
 
 
-def _send_general_telegram_plain(token, text, chat_id=None, keyboard=None):
-    """Send a plain-text message (no Markdown parsing). Returns message_id or None."""
-    import requests as _requests
-    if chat_id is None:
-        _, chat_id = _get_telegram_config()
-    if not chat_id:
-        return None
-    payload = {"chat_id": chat_id, "text": text}
-    if keyboard:
-        payload["reply_markup"] = {"inline_keyboard": keyboard}
-    resp = _requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json=payload, timeout=10,
-    )
-    if resp.ok:
-        return resp.json()["result"]["message_id"]
-    print(f"  → _send_general_telegram_plain error: {resp.text}")
-    return None
-
-
 def _handle_telegram_update(update, token):
-    """Process a single Telegram update."""
+    """Process a single Telegram update (unified for all email types)."""
     import requests as _requests
     import json as _json
-    from assistant import send_telegram
 
     def ack(callback_id):
         _requests.post(
@@ -376,7 +356,6 @@ def _handle_telegram_update(update, token):
                     pending_approvals[approval_id]["status"] = "sent"
                     save_pending_approvals()
                     sender = item["email"]["sender"].split("<")[0].strip()
-                    # Edit the draft message (the one with the buttons) to show sent
                     draft_msg_id = item.get("draft_telegram_message_id")
                     if draft_msg_id:
                         edit_telegram_message(draft_msg_id, f"✅ Sent to {sender}", keyboard=[])
@@ -406,7 +385,6 @@ def _handle_telegram_update(update, token):
                 pending_approvals[approval_id]["status"] = "discarded"
                 save_pending_approvals()
                 sender = item["email"]["sender"].split("<")[0].strip()
-                # Edit whichever message has the Discard button
                 button_msg_id = callback["message"]["message_id"]
                 edit_telegram_message(button_msg_id, f"🗑️ Discarded ({sender})", keyboard=[])
             else:
@@ -431,12 +409,8 @@ def _handle_telegram_update(update, token):
                 sent_id = _send_telegram_plain(token, msg_text)
                 if sent_id:
                     pending_approvals[approval_id]["calendar_json_preview"] = preview
-                    pending_approvals[f"tgcal:{sent_id}"] = approval_id
+                    pending_approvals[f"cal:{sent_id}"] = approval_id
                     save_pending_approvals()
-
-        elif callback_data.startswith("gen_"):
-            # Delegate gen_send:, gen_edit:, gen_discard:, gen_cal: to general handler
-            _handle_general_telegram_update(update, token)
 
         return
 
@@ -450,21 +424,21 @@ def _handle_telegram_update(update, token):
         return
 
     # ── Reply to original notification → draft from instructions ──────────
-    approval_id = pending_approvals.get(f"tgorig:{replied_msg_id}")
+    approval_id = pending_approvals.get(f"orig:{replied_msg_id}")
     if approval_id:
         item = pending_approvals.get(approval_id)
         if item and item["status"] in ("awaiting_instructions", "pending"):
             try:
-                from assistant import draft_from_instructions, build_meeting_tg_message
+                from assistant import draft_from_instructions
                 new_draft = draft_from_instructions(item, text)
                 pending_approvals[approval_id]["reply_text"] = new_draft
                 pending_approvals[approval_id]["status"] = "pending"
                 save_pending_approvals()
-                message, keyboard = build_meeting_tg_message(approval_id, is_redraft=False)
-                draft_msg_id = send_telegram(message, keyboard)
+                tg_msg, keyboard = build_tg_message(approval_id, is_redraft=False)
+                draft_msg_id = send_telegram(tg_msg, keyboard)
                 if draft_msg_id:
                     pending_approvals[approval_id]["draft_telegram_message_id"] = draft_msg_id
-                    pending_approvals[f"tgdraft:{draft_msg_id}"] = approval_id
+                    pending_approvals[f"draft:{draft_msg_id}"] = approval_id
                     save_pending_approvals()
             except Exception as e:
                 send_telegram(f"❌ Draft error: {str(e)}")
@@ -473,17 +447,17 @@ def _handle_telegram_update(update, token):
         return
 
     # ── Reply to draft message → re-draft with new instructions ───────────
-    approval_id = pending_approvals.get(f"tgdraft:{replied_msg_id}")
+    approval_id = pending_approvals.get(f"draft:{replied_msg_id}")
     if approval_id:
         item = pending_approvals.get(approval_id)
         if item and item["status"] == "pending":
             try:
-                from assistant import redraft_with_notes, build_meeting_tg_message
+                from assistant import redraft_with_notes
                 new_draft = redraft_with_notes(item, text)
                 pending_approvals[approval_id]["reply_text"] = new_draft
                 save_pending_approvals()
-                message, keyboard = build_meeting_tg_message(approval_id, is_redraft=True)
-                edit_telegram_message(replied_msg_id, message, keyboard)
+                tg_msg, keyboard = build_tg_message(approval_id, is_redraft=True)
+                edit_telegram_message(replied_msg_id, tg_msg, keyboard)
             except Exception as e:
                 send_telegram(f"❌ Re-draft error: {str(e)}")
         else:
@@ -512,7 +486,7 @@ def _handle_telegram_update(update, token):
         return
 
     # ── Reply to calendar JSON preview → create calendar event ────────────
-    approval_id = pending_approvals.get(f"tgcal:{replied_msg_id}")
+    approval_id = pending_approvals.get(f"cal:{replied_msg_id}")
     if approval_id:
         item = pending_approvals.get(approval_id)
         if item:
@@ -557,220 +531,15 @@ def _handle_telegram_update(update, token):
                 send_telegram(f"📅 Calendar event created{invite_str}!{meet_str}{date_warn}\n[Open event]({cal_link})")
             except Exception as e:
                 send_telegram(f"❌ Calendar error: {str(e)}")
-        return  # handled by tgcal: — don't fall through to general handler
-
-    # ── Also handle gen_* callbacks and gentg/gentgorig/gentgdraft messages ─
-    _handle_general_telegram_update(update, token)
 
 
 @app.route("/status")
 def status():
+    real = [v for v in pending_approvals.values() if isinstance(v, dict) and "email" in v]
     return jsonify({
-        "pending": sum(1 for v in pending_approvals.values() if v["status"] == "pending"),
-        "total": len(pending_approvals),
+        "pending": sum(1 for v in real if v.get("status") == "pending"),
+        "total": len(real),
     })
-
-
-def _handle_general_telegram_update(update, token):
-    """Handle button presses and reply-edits for the general email bot."""
-    import requests as _requests
-    import json as _json
-
-    def ack(callback_id):
-        _requests.post(
-            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
-            json={"callback_query_id": callback_id}, timeout=5
-        )
-
-    # ── Button press ──────────────────────────────────────────────────────
-    callback = update.get("callback_query")
-    if callback:
-        callback_data = callback.get("data", "")
-        ack(callback["id"])
-
-        if callback_data.startswith("gen_send:"):
-            approval_id = callback_data.split(":", 1)[1]
-            item = pending_approvals.get(approval_id)
-            if item and item["status"] == "pending":
-                try:
-                    send_reply(item["email"], item["reply_text"])
-                    pending_approvals[approval_id]["status"] = "sent"
-                    save_pending_approvals()
-                    sender = item["email"]["sender"].split("<")[0].strip()
-                    draft_msg_id = item.get("draft_telegram_message_id")
-                    if draft_msg_id:
-                        edit_general_telegram_message(draft_msg_id, f"✅ Sent to {sender}", keyboard=[])
-                    cal_keyboard = [[{"text": "📅 Calendar Invite", "callback_data": f"gen_cal:{approval_id}"}]]
-                    send_general_telegram(f"✅ Reply sent to *{sender}*!", keyboard=cal_keyboard)
-                except Exception as e:
-                    send_general_telegram(f"❌ Error: {str(e)}")
-            else:
-                send_general_telegram("⚠️ Already sent or discarded.")
-
-        elif callback_data.startswith("gen_edit:"):
-            approval_id = callback_data.split(":", 1)[1]
-            item = pending_approvals.get(approval_id)
-            if item and item["status"] == "pending":
-                draft = item["reply_text"]
-                sent_id = send_general_telegram(f"`{draft}`")
-                if sent_id:
-                    pending_approvals[f"gentg:{sent_id}"] = approval_id
-                    save_pending_approvals()
-            else:
-                send_general_telegram("⚠️ Already sent or discarded.")
-
-        elif callback_data.startswith("gen_discard:"):
-            approval_id = callback_data.split(":", 1)[1]
-            item = pending_approvals.get(approval_id)
-            if item and item["status"] in ("awaiting_instructions", "pending"):
-                pending_approvals[approval_id]["status"] = "discarded"
-                save_pending_approvals()
-                sender = item["email"]["sender"].split("<")[0].strip()
-                button_msg_id = callback["message"]["message_id"]
-                edit_general_telegram_message(button_msg_id, f"🗑️ Discarded ({sender})", keyboard=[])
-            else:
-                send_general_telegram("⚠️ Already sent or discarded.")
-
-        elif callback_data.startswith("gen_cal:"):
-            approval_id = callback_data.split(":", 1)[1]
-            item = pending_approvals.get(approval_id)
-            if item is None:
-                send_general_telegram(f"⚠️ Item not found (id: {approval_id})")
-            else:
-                original_details = item.get("meeting_details") or {}
-                confirmed = extract_meeting_details_from_reply(
-                    item.get("reply_text", ""), original_details
-                )
-                preview = build_calendar_json_preview(confirmed, item["email"])
-                msg_text = (
-                    "📅 Calendar invite — reply 'ok' to confirm or paste edited JSON:\n\n"
-                    f"{preview}\n\n"
-                    'Set "invite" to "me_only" or "all"'
-                )
-                sent_id = _send_general_telegram_plain(token, msg_text)
-                if sent_id:
-                    pending_approvals[approval_id]["calendar_json_preview"] = preview
-                    pending_approvals[f"gentgcal:{sent_id}"] = approval_id
-                    save_pending_approvals()
-        return
-
-    # ── Incoming text message ─────────────────────────────────────────────
-    message = update.get("message", {})
-    text = message.get("text", "").strip()
-    reply_to = message.get("reply_to_message", {})
-    replied_msg_id = reply_to.get("message_id")
-
-    if not (text and replied_msg_id):
-        return
-
-    # ── Reply to original notification → draft from instructions ──────────
-    approval_id = pending_approvals.get(f"gentgorig:{replied_msg_id}")
-    if approval_id:
-        item = pending_approvals.get(approval_id)
-        if item and item["status"] in ("awaiting_instructions", "pending"):
-            try:
-                from assistant import draft_from_instructions, build_general_tg_message
-                new_draft = draft_from_instructions(item, text)
-                pending_approvals[approval_id]["reply_text"] = new_draft
-                pending_approvals[approval_id]["status"] = "pending"
-                save_pending_approvals()
-                message, keyboard = build_general_tg_message(approval_id, is_redraft=False)
-                draft_msg_id = send_general_telegram(message, keyboard)
-                if draft_msg_id:
-                    pending_approvals[approval_id]["draft_telegram_message_id"] = draft_msg_id
-                    pending_approvals[f"gentgdraft:{draft_msg_id}"] = approval_id
-                    save_pending_approvals()
-            except Exception as e:
-                send_general_telegram(f"❌ Draft error: {str(e)}")
-        else:
-            send_general_telegram("⚠️ This email was already handled.")
-        return
-
-    # ── Reply to draft message → re-draft with new instructions ───────────
-    approval_id = pending_approvals.get(f"gentgdraft:{replied_msg_id}")
-    if approval_id:
-        item = pending_approvals.get(approval_id)
-        if item and item["status"] == "pending":
-            try:
-                from assistant import redraft_with_notes, build_general_tg_message
-                new_draft = redraft_with_notes(item, text)
-                pending_approvals[approval_id]["reply_text"] = new_draft
-                save_pending_approvals()
-                message, keyboard = build_general_tg_message(approval_id, is_redraft=True)
-                edit_general_telegram_message(replied_msg_id, message, keyboard)
-            except Exception as e:
-                send_general_telegram(f"❌ Re-draft error: {str(e)}")
-        else:
-            send_general_telegram("⚠️ This email was already handled.")
-        return
-
-    # ── Reply to Edit & Send message → send edited text as email ──────────
-    approval_id = pending_approvals.get(f"gentg:{replied_msg_id}")
-    if approval_id:
-        item = pending_approvals.get(approval_id)
-        if item and item["status"] == "pending":
-            try:
-                send_reply(item["email"], text)
-                pending_approvals[approval_id]["status"] = "sent"
-                save_pending_approvals()
-                sender = item["email"]["sender"].split("<")[0].strip()
-                draft_msg_id = item.get("draft_telegram_message_id")
-                if draft_msg_id:
-                    edit_general_telegram_message(draft_msg_id, f"✅ Sent to {sender}", keyboard=[])
-                cal_keyboard = [[{"text": "📅 Calendar Invite", "callback_data": f"gen_cal:{approval_id}"}]]
-                send_general_telegram(f"✅ Reply sent to *{sender}*!", keyboard=cal_keyboard)
-            except Exception as e:
-                send_general_telegram(f"❌ Error: {str(e)}")
-        else:
-            send_general_telegram("⚠️ This email was already handled.")
-        return
-
-    # ── Reply to calendar JSON preview → create calendar event ────────────
-    approval_id = pending_approvals.get(f"gentgcal:{replied_msg_id}")
-    if approval_id:
-        item = pending_approvals.get(approval_id)
-        if item:
-            if text.strip().lower() == "ok":
-                stored = item.get("calendar_json_preview")
-                if not stored:
-                    send_general_telegram("❌ No calendar preview found — please paste the JSON directly.")
-                    return
-                try:
-                    cal_data = _json.loads(stored)
-                except _json.JSONDecodeError:
-                    send_general_telegram("❌ Stored preview is invalid — please paste the JSON directly.")
-                    return
-            else:
-                import re as _re
-                json_match = _re.search(r'\{.*\}', text, _re.DOTALL)
-                if not json_match:
-                    send_general_telegram("❌ Could not find JSON in your reply — please paste just the JSON block.")
-                    return
-                try:
-                    cal_data = _json.loads(json_match.group())
-                except _json.JSONDecodeError:
-                    send_general_telegram("❌ Invalid JSON — please check the format and try again.")
-                    return
-            try:
-                confirmed_details = {
-                    "proposed_date": resolve_proposed_date(cal_data.get("date", "")),
-                    "proposed_time": cal_data.get("time"),
-                    "duration_minutes": int(cal_data.get("duration_minutes", 60)),
-                    "location": cal_data.get("location", ""),
-                    "meeting_type": item.get("meeting_details", {}).get("meeting_type", "in-person"),
-                    "topic": cal_data.get("title", ""),
-                    "attendees": item.get("meeting_details", {}).get("attendees", []),
-                }
-                invite_sender = cal_data.get("invite") in ("everyone", "all")
-                cal_link, meet_link, date_uncertain = create_calendar_event(
-                    confirmed_details, item["email"], invite_sender=invite_sender
-                )
-                meet_str = f"\n🎥 Meet link: {meet_link}" if meet_link else ""
-                invite_str = " + invite sent to sender" if invite_sender else ""
-                date_warn = "\n⚠️ *Date uncertain — please update the event!*" if date_uncertain else ""
-                send_general_telegram(f"📅 Calendar event created{invite_str}!{meet_str}{date_warn}\n[Open event]({cal_link})")
-            except Exception as e:
-                send_general_telegram(f"❌ Calendar error: {str(e)}")
 
 
 def start_polling():
