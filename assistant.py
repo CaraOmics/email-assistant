@@ -1030,6 +1030,7 @@ def send_reply(email, reply_text):
     msg["Subject"] = f"Re: {email['subject']}"
     msg["From"] = WORK_EMAIL
     msg["To"] = to_address
+    msg["Cc"] = "colm@caraomics.ai"
     msg["In-Reply-To"] = email.get("message_id", "")
     msg["References"] = email.get("message_id", "")
 
