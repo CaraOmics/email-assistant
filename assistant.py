@@ -144,7 +144,6 @@ def send_daily_digest():
                 (since,),
             ).fetchall()
         if not rows:
-            send_telegram("📋 *Daily digest:* No emails were filtered in the last 24 hours.")
             return
         lines = [f"📋 *Daily digest* — {len(rows)} email(s) filtered in the last 24h:\n"]
         for sender, subject, stage in rows[:30]:
