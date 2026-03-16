@@ -16,6 +16,7 @@ from assistant import (
     edit_telegram_message,
     _get_telegram_config,
     build_tg_message,
+    fetch_email_by_id, process_email,
 )
 
 app = Flask(__name__)
@@ -389,6 +390,26 @@ def _handle_telegram_update(update, token):
                 edit_telegram_message(button_msg_id, f"🗑️ Discarded ({sender})", keyboard=[])
             else:
                 send_telegram("⚠️ Already sent or discarded.")
+
+        elif callback_data == "unfilter_digest":
+            digest_msg_id = callback["message"]["message_id"]
+            filtered_emails = pending_approvals.get(f"digest:{digest_msg_id}", [])
+            if not filtered_emails:
+                send_telegram("⚠️ No unfilter data found for this digest.")
+            else:
+                buttons = [
+                    [{"text": f"{e['sender'].split('<')[0].strip()[:25]} — {e['subject'][:35]}", "callback_data": f"unfilter_email:{e['id']}"}]
+                    for e in filtered_emails
+                ]
+                edit_telegram_message(digest_msg_id, callback["message"]["text"], keyboard=buttons)
+
+        elif callback_data.startswith("unfilter_email:"):
+            email_id = callback_data.split(":", 1)[1]
+            email = fetch_email_by_id(email_id)
+            if not email:
+                send_telegram("❌ Could not re-fetch this email from Gmail.")
+            else:
+                process_email(email, skip_llm=True)
 
         elif callback_data.startswith("cal:"):
             approval_id = callback_data.split(":", 1)[1]

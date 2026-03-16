@@ -62,9 +62,16 @@ def _db_init():
                 sender      TEXT NOT NULL,
                 subject     TEXT NOT NULL,
                 stage       TEXT NOT NULL,
-                filtered_at REAL NOT NULL
+                filtered_at REAL NOT NULL,
+                email_id    TEXT NOT NULL DEFAULT ''
             )
         """)
+        # Migration: add email_id column if it doesn't exist yet
+        try:
+            conn.execute("ALTER TABLE filtered_log ADD COLUMN email_id TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
         conn.commit()
 
 
@@ -125,8 +132,8 @@ def log_filtered_email(email, stage):
         with _db_lock:
             with sqlite3.connect(DB_FILE) as conn:
                 conn.execute(
-                    "INSERT INTO filtered_log (sender, subject, stage, filtered_at) VALUES (?, ?, ?, ?)",
-                    (email.get("sender", ""), email.get("subject", ""), stage, time.time()),
+                    "INSERT INTO filtered_log (sender, subject, stage, filtered_at, email_id) VALUES (?, ?, ?, ?, ?)",
+                    (email.get("sender", ""), email.get("subject", ""), stage, time.time(), email.get("id", "")),
                 )
                 conn.commit()
     except Exception as e:
@@ -139,19 +146,26 @@ def send_daily_digest():
         since = time.time() - 86400
         with sqlite3.connect(DB_FILE) as conn:
             rows = conn.execute(
-                "SELECT sender, subject, stage FROM filtered_log "
+                "SELECT sender, subject, stage, email_id FROM filtered_log "
                 "WHERE filtered_at > ? ORDER BY filtered_at DESC",
                 (since,),
             ).fetchall()
         if not rows:
             return
         lines = [f"📋 *Daily digest* — {len(rows)} email(s) filtered in the last 24h:\n"]
-        for sender, subject, stage in rows[:30]:
+        llm_filtered = []
+        for sender, subject, stage, email_id in rows[:30]:
             tag = "🤖 auto" if stage == "automated_sender" else "🧠 LLM"
             s = _tg_escape(sender.split("<")[0].strip()[:30] or sender[:30])
             subj = _tg_escape(subject[:50])
             lines.append(f"{tag} — *{s}*: _{subj}_")
-        send_telegram("\n".join(lines))
+            if stage == "llm_filter" and email_id:
+                llm_filtered.append({"id": email_id, "sender": sender, "subject": subject})
+        keyboard = [[{"text": "🔓 Unfilter", "callback_data": "unfilter_digest"}]] if llm_filtered else None
+        msg_id = send_telegram("\n".join(lines), keyboard=keyboard)
+        if msg_id and llm_filtered:
+            pending_approvals[f"digest:{msg_id}"] = llm_filtered
+            save_pending_approvals()
     except Exception as e:
         print(f"  → send_daily_digest error: {e}")
 
@@ -1327,7 +1341,18 @@ def build_general_tg_message(approval_id, is_redraft=False):
     return build_tg_message(approval_id, is_redraft)
 
 
-def process_email(email):
+def fetch_email_by_id(email_id):
+    """Re-fetch a single Gmail message by ID and return parsed email dict, or None on error."""
+    try:
+        service = get_gmail_service()
+        full_msg = service.users().messages().get(userId="me", id=email_id, format="full").execute()
+        return parse_email(full_msg)
+    except Exception as e:
+        print(f"  → fetch_email_by_id error: {e}")
+        return None
+
+
+def process_email(email, skip_llm=False):
     """Notify about incoming email — no auto-draft. User replies with instructions to draft."""
     print(f"\nProcessing email: {email['subject']} from {email['sender']}")
 
@@ -1336,11 +1361,14 @@ def process_email(email):
         log_filtered_email(email, "automated_sender")
         return
 
-    should_notify, clean_body = _llm_filter_and_clean(email)
-    if not should_notify:
-        print(f"  → LLM filter: skipping (not worth notifying)")
-        log_filtered_email(email, "llm_filter")
-        return
+    if not skip_llm:
+        should_notify, clean_body = _llm_filter_and_clean(email)
+        if not should_notify:
+            print(f"  → LLM filter: skipping (not worth notifying)")
+            log_filtered_email(email, "llm_filter")
+            return
+    else:
+        _, clean_body = _llm_filter_and_clean(email)  # still clean body, just don't filter
 
     meeting_related = is_meeting_related(email)
     icon = "📬" if meeting_related else "📧"
